@@ -1,9 +1,11 @@
 'use client';
+import {readScanDraft,saveScanDraft} from './scan-storage';
+import {canonicalQuantity, quantityLabel, recipeQuantity} from './quantities';
 import {useEffect,useMemo,useRef,useState} from 'react';
 import {createClient, type SupabaseClient} from '@supabase/supabase-js';
 type Section='Fruits & Vegetables'|'Meat & Seafood'|'Other Frozen Foods'|'Pantry & Dry Goods'|'Condiments & Soup Bases'|'Refrigerated Essentials';
 type Item={id:string,brand?:string,originalName?:string,packageQty?:number,remainingPct?:number,photoIndex?:number,reviewReason?:string,name:string,qty:number,unit:string,section:Section,location:string,date:string,dateType:string,notes?:string,rangeMin?:number|null,rangeMax?:number|null,kcal100?:number,protein100?:number,carb100?:number,fat100?:number,nutritionVerified?:boolean,confidence?:string,source?:string};
-type Ingredient={name:string,g:number,kcal100:number,protein100:number,carb100:number,fat100:number};
+type Ingredient={name:string,g?:number,qty?:number,unit?:string,kcal100:number,protein100:number,carb100:number,fat100:number};
 type Recipe={id:string,name:string,servings:number,ingredients:Ingredient[],steps:string[],notes:string};
 type Chat={role:'user'|'assistant',content:string};
 type ImportItem=Omit<Item,'id'> & {id?:string};
@@ -16,21 +18,32 @@ const norm=(s:string)=>s.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}\p
 const ingredientKey=(s:string)=>norm(s).replace(/([a-z])s$/, '$1');
 function normalizeSection(x:string):Section{return sections.includes(x as Section)?x as Section:'Pantry & Dry Goods'}
 function dateDiff(d:string){if(!d)return null;const a=new Date();a.setHours(0,0,0,0);const b=new Date(d+'T00:00:00');return Math.round((b.getTime()-a.getTime())/86400000)}
-function nutrition(r:Recipe){return r.ingredients.reduce((a,i)=>({kcal:a.kcal+i.g*i.kcal100/100,protein:a.protein+i.g*i.protein100/100,carb:a.carb+i.g*i.carb100/100,fat:a.fat+i.g*i.fat100/100}),{kcal:0,protein:0,carb:0,fat:0})}
+function nutrition(r:Recipe){
+ return r.ingredients.reduce((total,ingredient)=>{
+  const amount=canonicalQuantity(recipeQuantity(ingredient));
+  if(amount.unit!=='g'||!amount.qty||!ingredient.kcal100)return total;
+  const scale=amount.qty/100;
+  return {kcal:total.kcal+scale*ingredient.kcal100,protein:total.protein+scale*(ingredient.protein100||0),carb:total.carb+scale*(ingredient.carb100||0),fat:total.fat+scale*(ingredient.fat100||0)};
+ },{kcal:0,protein:0,carb:0,fat:0});
+}
+const defaultTargets={Kun:{calories:2100,protein:180},Winnie:{calories:1350,protein:100}};
+type Person=keyof typeof defaultTargets;
+const defaultPreferences='Japanese, Thai and Chinese-inspired, high protein, vegetable-forward; quick lunches, warm dinners';
+
 function normalizeItem(raw:ImportItem,source='scan'):Item{return {id:uid(),name:String(raw.name||'Unknown item').trim(),brand:String(raw.brand||''),originalName:String(raw.originalName||''),packageQty:Number(raw.packageQty)||Number(raw.qty)||0,remainingPct:100,photoIndex:Number(raw.photoIndex)||0,reviewReason:String(raw.reviewReason||''),qty:Math.max(0,Number(raw.qty)||0),unit:['g','kg','pcs','ml','packs'].includes(raw.unit)?raw.unit:'g',section:normalizeSection(raw.section),location:['Fridge','Freezer','Pantry'].includes(raw.location)?raw.location:'Fridge',date:/^\d{4}-\d{2}-\d{2}$/.test(raw.date||'')?raw.date:'',dateType:raw.dateType||'Unknown',notes:raw.notes||'',rangeMin:raw.rangeMin??null,rangeMax:raw.rangeMax??null,kcal100:Number(raw.kcal100)||0,protein100:Number(raw.protein100)||0,carb100:Number(raw.carb100)||0,fat100:Number(raw.fat100)||0,nutritionVerified:!!raw.nutritionVerified,confidence:raw.confidence||'medium',source}}
 type ScanPhoto = {
  file: File;
  status: 'queued' | 'processing' | 'done' | 'review' | 'failed';
  detail?: string;
 };
-async function readPhoto(file: File): Promise<string> {
+async function readPhoto(file: File, maxSide=1800): Promise<string> {
  const url = URL.createObjectURL(file);
  try {
   const image = new Image();
   image.src = url;
   await image.decode();
   const canvas = document.createElement('canvas');
-  const scale = Math.min(1, 1800 / Math.max(image.width, image.height));
+  const scale = Math.min(1, maxSide / Math.max(image.width, image.height));
   canvas.width = Math.max(1, Math.round(image.width * scale));
   canvas.height = Math.max(1, Math.round(image.height * scale));
   const context = canvas.getContext('2d');
@@ -45,28 +58,109 @@ export default function Page(){
  const [ready,setReady]=useState(false),[tab,setTab]=useState('Home'),[items,setItems]=useState<Item[]>([]),[recipes,setRecipes]=useState<Recipe[]>([curry]),[plan,setPlan]=useState<Record<string,string>>({}),[shopping,setShopping]=useState<string[]>([]),[cooked,setCooked]=useState<Record<string,boolean>>({}),[lastCounts,setLastCounts]=useState<Record<string,string>>({}),[history,setHistory]=useState<Chat[]>([]);
  const [scanPhotos,setScanPhotos]=useState<ScanPhoto[]>([]),[scanning,setScanning]=useState(false),[scanChat,setScanChat]=useState(''),[scanMessages,setScanMessages]=useState<Chat[]>([]),[recipeImport,setRecipeImport]=useState('');
  const scanAbort=useRef(false);
- const [recipeId,setRecipeId]=useState('curry'),[scanKind,setScanKind]=useState<'groceries'|'receipt'|'recount'>('groceries'),[section,setSection]=useState<Section>(sections[0]),[scanned,setScanned]=useState<Item[]>([]),[busy,setBusy]=useState(false),[error,setError]=useState(''),[summary,setSummary]=useState(''),[message,setMessage]=useState(''),[draftRecipes,setDraftRecipes]=useState<Recipe[]>([]),[draftPlan,setDraftPlan]=useState<Record<string,string>>({}),[draftShopping,setDraftShopping]=useState<string[]>([]),[showManual,setShowManual]=useState(false),[manualName,setManualName]=useState(''),[manualQty,setManualQty]=useState(''),[manualUnit,setManualUnit]=useState('g'),[manualSection,setManualSection]=useState<Section>(sections[0]),[manualDate,setManualDate]=useState(''),[openMeal,setOpenMeal]=useState(''),[undo,setUndo]=useState<{items:Item[],cooked:Record<string,boolean>}|null>(null),[person,setPerson]=useState('Kun');
- useEffect(()=>{try{const x=JSON.parse(localStorage.getItem(key)||localStorage.getItem(oldKey)||'null');if(x){setItems((x.items||[]).map((i:Item)=>({...i,section:i.section||sections[0]})));setRecipes(x.recipes?.length?x.recipes:[curry]);setPlan(x.plan||{});setShopping(x.shopping||[]);setCooked(x.cooked||{});setLastCounts(x.lastCounts||{});setHistory(x.history||[])}}catch{}setReady(true)},[]);
- useEffect(()=>{if(ready)try{localStorage.setItem(key,JSON.stringify({items,recipes,plan,shopping,cooked,lastCounts,history:history.slice(-30)}))}catch{setError('Local storage is full. Export a backup from Settings.')}},[ready,items,recipes,plan,shopping,cooked,lastCounts,history]);
+ const [recipeId,setRecipeId]=useState('curry'),[scanKind,setScanKind]=useState<'groceries'|'receipt'|'recount'>('groceries'),[section,setSection]=useState<Section>(sections[0]),[scanned,setScanned]=useState<Item[]>([]),[busy,setBusy]=useState(false),[error,setError]=useState(''),[summary,setSummary]=useState(''),[message,setMessage]=useState(''),[draftRecipes,setDraftRecipes]=useState<Recipe[]>([]),[draftPlan,setDraftPlan]=useState<Record<string,string>>({}),[draftShopping,setDraftShopping]=useState<string[]>([]),[showManual,setShowManual]=useState(false),[manualName,setManualName]=useState(''),[manualQty,setManualQty]=useState(''),[manualUnit,setManualUnit]=useState('g'),[manualSection,setManualSection]=useState<Section>(sections[0]),[manualDate,setManualDate]=useState(''),[openMeal,setOpenMeal]=useState(''),[undo,setUndo]=useState<{items:Item[],cooked:Record<string,boolean>}|null>(null),[person,setPerson]=useState<Person>('Kun');
+ const [grouped,setGrouped]=useState(false),[draftLoaded,setDraftLoaded]=useState(false);
+ const [targets,setTargets]=useState(defaultTargets),[preferences,setPreferences]=useState(defaultPreferences);
+ useEffect(()=>{
+  let active=true;
+  readScanDraft<{photos:ScanPhoto[];items:Item[];kind:typeof scanKind;section:Section;grouped:boolean}>('grocery-scan')
+   .then(draft=>{
+    if(!active||!draft)return;
+    setScanPhotos(draft.photos.map(photo=>photo.status==='processing'?{...photo,status:'queued'}:photo));
+    setScanned(draft.items);
+    setScanKind(draft.kind);
+    setSection(draft.section);
+    setGrouped(draft.grouped);
+   }).catch(()=>{if(active)setError('Browser scan recovery is unavailable.')})
+   .finally(()=>{if(active)setDraftLoaded(true)});
+  return()=>{active=false};
+ },[]);
+ useEffect(()=>{
+  if(!draftLoaded)return;
+  const draft=scanPhotos.length||scanned.length?{photos:scanPhotos,items:scanned,kind:scanKind,section,grouped}:null;
+  void saveScanDraft('grocery-scan',draft).catch(()=>{if(draft)setError('This scan draft could not be saved to the browser.')});
+ },[draftLoaded,scanPhotos,scanned,scanKind,section,grouped]);
+ useEffect(()=>{try{const x=JSON.parse(localStorage.getItem(key)||localStorage.getItem(oldKey)||'null');if(x){setItems((x.items||[]).map((i:Item)=>({...i,section:i.section||sections[0]})));setRecipes(x.recipes?.length?x.recipes:[curry]);setPlan(x.plan||{});setShopping(x.shopping||[]);setCooked(x.cooked||{});setLastCounts(x.lastCounts||{});setHistory(x.history||[]);setTargets({...defaultTargets,...x.targets});setPreferences(typeof x.preferences==='string'?x.preferences:defaultPreferences)}}catch{}setReady(true)},[]);
+ useEffect(()=>{if(ready)try{localStorage.setItem(key,JSON.stringify({items,recipes,plan,shopping,cooked,lastCounts,history:history.slice(-30),targets,preferences}))}catch{setError('Local storage is full. Export a backup from Settings.')}},[ready,items,recipes,plan,shopping,cooked,lastCounts,history,targets,preferences]);
  const [authEmail,setAuthEmail]=useState(''),[authPassword,setAuthPassword]=useState(''),[authUser,setAuthUser]=useState(''),[authBusy,setAuthBusy]=useState(false),[cloudReady,setCloudReady]=useState(false),[cloudStatus,setCloudStatus]=useState('Not connected'),[cloudRevision,setCloudRevision]=useState(0),[householdId,setHouseholdId]=useState('');
  const cloud=useMemo<SupabaseClient|null>(()=>{const url=process.env.NEXT_PUBLIC_SUPABASE_URL;const key=process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;return url&&key?createClient(url,key,{auth:{persistSession:true,autoRefreshToken:true}}):null},[]);
- const snapshot=()=>({items,recipes,plan,shopping,cooked,lastCounts,history:history.slice(-30)});
- function loadSnapshot(x:any){setItems(Array.isArray(x.items)?x.items:[]);setRecipes(Array.isArray(x.recipes)&&x.recipes.length?x.recipes:[curry]);setPlan(x.plan||{});setShopping(x.shopping||[]);setCooked(x.cooked||{});setLastCounts(x.lastCounts||{});setHistory(x.history||[])}
- async function connectUser(userId:string,email:string){if(!cloud)return;setAuthUser(email);setCloudStatus('Checking household...');const {data:member,error:memberError}=await cloud.from('household_members').select('household_id').eq('user_id',userId).limit(1).maybeSingle();if(memberError||!member){setCloudStatus('Household access unavailable: '+(memberError?.message||'No membership'));return}setHouseholdId(member.household_id);const {data,error}=await cloud.from('kitchen_snapshots').select('data,revision').eq('household_id',member.household_id).maybeSingle();if(error){setCloudStatus('Database setup needed: '+error.message);return}if(data){loadSnapshot(data.data);setCloudRevision(data.revision);setCloudReady(true);setCloudStatus('Shared Kitchen loaded. Sync enabled.')}else{setCloudStatus('Shared household is empty. Export a backup, then select Migrate browser data in Settings.');}}
+ const snapshot=()=>({items,recipes,plan,shopping,cooked,lastCounts,history:history.slice(-30),targets,preferences});
+ function loadSnapshot(x:any){setItems(Array.isArray(x.items)?x.items:[]);setRecipes(Array.isArray(x.recipes)&&x.recipes.length?x.recipes:[curry]);setPlan(x.plan||{});setShopping(x.shopping||[]);setCooked(x.cooked||{});setLastCounts(x.lastCounts||{});setHistory(x.history||[]);setTargets({...defaultTargets,...x.targets});setPreferences(typeof x.preferences==='string'?x.preferences:defaultPreferences)}
+ async function connectUser(userId:string,email:string){if(!cloud)return;setAuthUser(email);setCloudStatus('Checking household...');const {data:member,error:memberError}=await cloud.from('household_members').select('household_id').eq('user_id',userId).limit(1).maybeSingle();if(memberError||!member){setCloudStatus('Household access unavailable: '+(memberError?.message||'No membership'));return}setHouseholdId(member.household_id);const {data,error}=await cloud.from('kitchen_snapshots').select('data,revision').eq('household_id',member.household_id).maybeSingle();if(error){setCloudStatus('Database setup needed: '+error.message);return}if(data){syncGeneration.current++;syncedSnapshot.current='';loadSnapshot(data.data);setCloudRevision(data.revision);setCloudReady(true);setCloudStatus('Shared Kitchen loaded. Sync enabled.')}else{setCloudStatus('Shared household is empty. Export a backup, then select Migrate browser data in Settings.');}}
  useEffect(()=>{if(!cloud)return;let active=true;cloud.auth.getUser().then(({data})=>{if(active&&data.user)void connectUser(data.user.id,data.user.email||'Signed in')});return()=>{active=false}},[cloud]);
  async function signIn(){if(!cloud)return;setAuthBusy(true);setCloudStatus('Signing in...');const {data,error}=await cloud.auth.signInWithPassword({email:authEmail.trim(),password:authPassword});setAuthBusy(false);setAuthPassword('');if(error){setCloudStatus(error.message);return}if(data.user)await connectUser(data.user.id,data.user.email||authEmail)}
- async function signOut(){if(!cloud)return;await cloud.auth.signOut();setAuthUser('');setHouseholdId('');setCloudReady(false);setCloudRevision(0);setCloudStatus('Signed out. Browser copy retained.');}
+ async function signOut(){if(!cloud)return;syncGeneration.current++;syncedSnapshot.current='';await cloud.auth.signOut();setAuthUser('');setHouseholdId('');setCloudReady(false);setCloudRevision(0);setCloudStatus('Signed out. Browser copy retained.');}
  function exportBackup(){const blob=new Blob([JSON.stringify(snapshot(),null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='kitchen-backup-'+new Date().toISOString().slice(0,10)+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
  async function migrateBrowser(){if(!cloud||!householdId||cloudReady)return;exportBackup();if(!window.confirm('A JSON backup has been downloaded. Import the current browser data into your EMPTY shared household? This will not delete the browser copy.'))return;setCloudStatus('Migrating...');const {data,error}=await cloud.from('kitchen_snapshots').insert({household_id:householdId,data:snapshot(),revision:1}).select('revision').single();if(error){setCloudStatus('Migration stopped: '+error.message+' (no browser data deleted)');return}setCloudRevision(data.revision);setCloudReady(true);setCloudStatus('Migration complete. Shared sync enabled. Check on both accounts.');}
- const skipSync=useRef(true);
- useEffect(()=>{if(!cloudReady||!cloud||!householdId)return;if(skipSync.current){skipSync.current=false;return}const timer=setTimeout(async()=>{const {data,error}=await cloud.rpc('save_kitchen_snapshot',{p_household_id:householdId,p_expected_revision:cloudRevision,p_data:snapshot()});if(error){setCloudReady(false);setCloudStatus('Sync paused: '+error.message+'. Your browser copy remains available. Reload to retrieve latest cloud version.');return}setCloudRevision(Number(data));setCloudStatus('Saved to shared Kitchen')},1200);return()=>clearTimeout(timer)},[items,recipes,plan,shopping,cooked,lastCounts,history,cloudReady,householdId]);
+ const syncRevision=useRef(0);
+ const syncedSnapshot=useRef('');
+ const syncQueue=useRef<Promise<void>>(Promise.resolve());
+ const syncGeneration=useRef(0);
+ useEffect(()=>{
+  if(!cloudReady||!cloud||!householdId)return;
+  const state=JSON.stringify(snapshot());
+  const generation=syncGeneration.current;
+  if(!syncedSnapshot.current){
+   syncedSnapshot.current=state;
+   syncRevision.current=cloudRevision;
+   return;
+  }
+  const timer=setTimeout(()=>{
+   syncQueue.current=syncQueue.current.then(async()=>{
+    if(generation!==syncGeneration.current||state===syncedSnapshot.current)return;
+    try{
+     const {data,error}=await cloud.rpc('save_kitchen_snapshot',{p_household_id:householdId,p_expected_revision:syncRevision.current,p_data:JSON.parse(state)});
+     if(generation!==syncGeneration.current)return;
+     if(error)throw error;
+     syncRevision.current=Number(data);
+     syncedSnapshot.current=state;
+     setCloudRevision(Number(data));
+     setCloudStatus('Saved to shared Kitchen');
+    }catch(error){
+     if(generation!==syncGeneration.current)return;
+     syncGeneration.current++;
+     setCloudReady(false);
+     const message=typeof error==='object'&&error&&'message' in error?String(error.message):'Connection interrupted';
+     setCloudStatus('Sync paused: '+message+'. Export a backup before reloading the latest shared version.');
+    }
+   });
+  },700);
+  return()=>clearTimeout(timer);
+ },[items,recipes,plan,shopping,cooked,lastCounts,history,targets,preferences,cloudReady,householdId]);
+ const currentSnapshot=useRef('');
+ useEffect(()=>{currentSnapshot.current=JSON.stringify(snapshot())},[items,recipes,plan,shopping,cooked,lastCounts,history,targets,preferences]);
+ useEffect(()=>{
+  if(!cloudReady||!cloud||!householdId)return;
+  let active=true;
+  const refresh=async()=>{
+   const generation=syncGeneration.current;
+   if(document.hidden||currentSnapshot.current!==syncedSnapshot.current)return;
+   const revision=syncRevision.current;
+   try{
+    const {data}=await cloud.from('kitchen_snapshots').select('data,revision').eq('household_id',householdId).maybeSingle();
+    if(!active||generation!==syncGeneration.current||!data||Number(data.revision)<=syncRevision.current||
+      revision!==syncRevision.current||currentSnapshot.current!==syncedSnapshot.current)return;
+    syncGeneration.current++;
+    syncedSnapshot.current='';
+    setUndo(null);
+    loadSnapshot(data.data);
+    setCloudRevision(Number(data.revision));
+    setCloudStatus('Updated from shared Kitchen');
+   }catch{/* Retain the last usable snapshot while offline. */}
+  };
+  window.addEventListener('focus',refresh);
+  const poll=window.setInterval(refresh,15000);
+  return()=>{active=false;window.removeEventListener('focus',refresh);window.clearInterval(poll)};
+ },[cloud,cloudReady,householdId]);
  const expiring=useMemo(()=>items.filter(i=>i.date&&dateDiff(i.date)!<=7).sort((a,b)=>(dateDiff(a.date)||0)-(dateDiff(b.date)||0)),[items]);
  const recipe=recipes.find(r=>r.id===recipeId)||recipes[0];
  function match(a:Item,b:Item){return norm(a.name)===norm(b.name)&&norm(a.brand||'')===norm(b.brand||'')&&norm(a.originalName||'')===norm(b.originalName||'')&&a.unit===b.unit}
  function applyImport(){if(busy||!scanned.length)return;if(scanPhotos.some(photo=>photo.status==='queued'||photo.status==='failed')&&!window.confirm('Some photos are pending or failed. Save only the items you have reviewed?'))return;let next=[...items];for(const item of scanned){const candidates=next.filter(i=>match(i,item));if(candidates.length){const promptText=`Possible duplicate: ${item.name} (${item.qty} ${item.unit}).\nExisting: ${candidates.map((c,j)=>`${j+1}: ${c.name} ${c.qty} ${c.unit}`).join('; ')}\n\nEnter existing entry number to REPLACE (default 1), A to ADD BOTH, or K to KEEP EXISTING. Cancel stops the import.`;const answer=window.prompt(promptText,'1');if(answer===null)return;const value=answer.trim().toUpperCase();if(value==='K')continue;if(value==='A'){next.push(item);continue}const index=Number(value||'1')-1;if(!Number.isInteger(index)||index<0||index>=candidates.length){alert('Invalid selection; import stopped without saving.');return}const original=candidates[index];next=next.map(i=>i.id===original.id?{...item,id:original.id}:i)}else next.push(item)}setItems(next);if(scanKind==='recount')setLastCounts(x=>({...x,[section]:new Date().toISOString().slice(0,10)}));setScanned([]);setScanPhotos([]);setSummary('');alert('Inventory updated.');}
  async function aiHeaders(){const token=(await cloud?.auth.getSession())?.data.session?.access_token;return {'Content-Type':'application/json',...(token?{'Authorization':`Bearer ${token}`}:{})}}
  async function scan(files: FileList | null) {
-  if (!files?.length || busy) return;
+  if (!files?.length || busy || !draftLoaded) return;
+  if (grouped && (files.length<2 || files.length>3)) {setError('Choose 2 or 3 photos of the same package.');return;}
+  if ((scanPhotos.length || scanned.length) && !window.confirm('Replace the current scan draft?')) return;
   if (files.length > 50) {
    setError('Choose up to 50 photos at a time. All selected photos are still available on your device.');
    return;
@@ -90,13 +184,14 @@ export default function Page(){
    for (const [index, photo] of batch.entries()) {
     if (scanAbort.current) break;
     if (photo.status !== 'queued' && photo.status !== 'failed') continue;
-    update(index, 'processing');
+    const indexes=grouped?batch.map((_,i)=>i):[index];
+    indexes.forEach(i=>update(i,'processing'));
     try {
-     const image = await readPhoto(photo.file);
+     const images=await Promise.all(indexes.map(i=>readPhoto(batch[i].file,grouped?1400:1800)));
      const response = await fetch('/api/ai', {
       method: 'POST',
       headers: await aiHeaders(),
-      body: JSON.stringify({mode:'scan', kind:scanKind, section, images:[image], photoIndex:index+1}),
+      body: JSON.stringify({mode:'scan', kind:scanKind, section, images, grouped, photoIndex:index+1}),
       signal: AbortSignal.timeout(90000),
      });
      const data = await response.json();
@@ -108,11 +203,12 @@ export default function Page(){
       .filter((item: Item) => scanKind !== 'recount' || item.section === section) as Item[];
      setScanned(previous => [...previous, ...found].sort((a,b) => (a.photoIndex ?? 0) - (b.photoIndex ?? 0)));
      const needsReview = !found.length || found.some(item => item.confidence !== 'high');
-     update(index, needsReview ? 'review' : 'done',
-      found.length ? `${found.length} candidate item(s)` : 'No item identified. Review this photo.');
+     indexes.forEach(i=>update(i, needsReview ? 'review' : 'done',
+      found.length ? `${found.length} candidate item(s)${grouped?' in this photo group':''}` : 'No item identified. Review this photo.'));
     } catch (error) {
-     update(index, 'failed', error instanceof Error ? error.message : 'Scan failed');
+     indexes.forEach(i=>update(i,'failed',error instanceof Error ? error.message : 'Scan failed'));
     }
+    if(grouped)break;
    }
   } finally {
    setBusy(false);
@@ -127,39 +223,65 @@ export default function Page(){
  }catch(e){setError(e instanceof Error?e.message:'Correction failed')}finally{setBusy(false)}}
  async function importRecipe(){if(!recipeImport.trim()||busy)return;setBusy(true);setError('');try{const res=await fetch('/api/ai',{method:'POST',headers:await aiHeaders(),body:JSON.stringify({mode:'recipe',text:recipeImport.slice(0,12000)})});const data=await res.json();if(!res.ok)throw Error(data.error||'Recipe import failed');const r=data.recipe as Recipe;if(!r?.name||!Array.isArray(r.ingredients)||!Array.isArray(r.steps))throw Error('Recipe was incomplete');r.id=uid();setRecipes(old=>[...old,r]);setRecipeId(r.id);setRecipeImport('');}catch(e){setError(e instanceof Error?e.message:'Import failed')}finally{setBusy(false)}}
  function saveManual(){if(!manualName.trim()||!(Number(manualQty)>0))return;setItems(x=>[...x,normalizeItem({name:manualName,qty:Number(manualQty),unit:manualUnit,section:manualSection,location:manualSection==='Pantry & Dry Goods'||manualSection==='Condiments & Soup Bases'?'Pantry':'Fridge',date:manualDate,dateType:'Unknown'},'manual')]);setManualName('');setManualQty('')}
- async function sendChat(){if(!message.trim()||busy)return;const input=message.trim();setMessage('');setHistory(h=>[...h,{role:'user',content:input}]);setBusy(true);setError('');try{const context={inventory:items.map(({name,qty,unit,section,date})=>({name,qty,unit,section,date})),savedPlan:plan,savedRecipes:recipes.map(r=>({id:r.id,name:r.name})),proposedPlan:draftPlan,proposedRecipes:draftRecipes,targets:{Kun:{calories:2100,protein:180},Winnie:{calories:1350,protein:100}},preferences:'Japanese, Thai and Chinese-inspired, high protein, vegetable-forward; quick lunches, warm dinners'};const res=await fetch('/api/ai',{method:'POST',headers:await aiHeaders(),body:JSON.stringify({mode:'chat',message:input,context,history:history.slice(-12)})});const data=await res.json();if(!res.ok)throw Error(data.error||'Chat failed');setHistory(h=>[...h,{role:'assistant',content:data.reply||'Draft updated.'}]);if(Array.isArray(data.recipes)&&data.recipes.length)setDraftRecipes(old=>{const m=new Map(old.map(r=>[r.id,r]));data.recipes.forEach((r:Recipe)=>{if(r.id&&r.name&&Array.isArray(r.ingredients))m.set(r.id,r)});return [...m.values()]});if(data.plan&&typeof data.plan==='object')setDraftPlan(p=>({...p,...data.plan}));if(Array.isArray(data.shopping))setDraftShopping(data.shopping);}catch(e){setError(e instanceof Error?e.message:'Chat failed');setHistory(h=>[...h,{role:'assistant',content:'I could not connect to AI. Your existing plan is unchanged.'}])}finally{setBusy(false)}}
- function approvePlan(){if(!Object.keys(draftPlan).length){alert('Ask Kitchen AI to draft a plan first.');return}const all=[...recipes];for(const r of draftRecipes){const index=all.findIndex(x=>x.id===r.id);if(index>=0)all[index]=r;else all.push(r)}const unknown=Object.values(draftPlan).filter(id=>id&&!all.some(r=>r.id===id));if(unknown.length){alert('Some proposed meals do not have complete recipes. Ask AI to regenerate those recipes before approving.');return}setRecipes(all);setPlan(draftPlan);setShopping(s=>Array.from(new Set([...s,...draftShopping])));setDraftPlan({});setDraftRecipes([]);setDraftShopping([]);setTab('Planner')}
- function markCooked(key:string,r:Recipe){if(cooked[key])return;const servings=Number(window.prompt('How many portions did you actually cook?',String(r.servings)));if(!Number.isFinite(servings)||servings<=0)return;const updated=items.map(i=>({...i}));const shortages:string[]=[];for(const ing of r.ingredients){let remaining=ing.g*servings/r.servings;const matching=updated.filter(i=>ingredientKey(i.name)===ingredientKey(ing.name)&&(i.unit==='g'||i.unit==='kg')).sort((a,b)=>(a.date||'9999').localeCompare(b.date||'9999'));for(const item of matching){const scale=item.unit==='kg'?1000:1;const take=Math.min(item.qty*scale,remaining);item.qty=Math.max(0,(item.qty*scale-take)/scale);remaining-=take;if(remaining<=.001)break}if(remaining>.001)shortages.push(`${ing.name}: ${Math.round(remaining)} g not matched`)}const used=items.flatMap(original=>{const after=updated.find(item=>item.id===original.id);const taken=original.qty-(after?.qty??original.qty);return taken>0?[`${original.name}: ${Number(taken.toFixed(6))} ${original.unit}`]:[]});if(!window.confirm(['Mark cooked and confirm inventory deductions?',...used,...shortages].join('\n')))return;setUndo({items,cooked});setItems(updated.filter(i=>i.qty>0));setCooked(x=>({...x,[key]:true}));alert('Meal marked cooked. Matching gram-based stock deducted. Undo is available in Planner.')}
- function shopMissing() {
-  const needed = new Map<string, {name: string; grams: number}>();
-  for (const [slot, id] of Object.entries(plan)) {
-   if (cooked[slot]) continue;
-   const recipe = recipes.find(entry => entry.id === id);
-   for (const ingredient of recipe?.ingredients ?? []) {
-    if (!Number.isFinite(ingredient.g) || ingredient.g <= 0) continue;
-    const key = ingredientKey(ingredient.name);
-    if (!key) continue;
-    const previous = needed.get(key);
-    needed.set(key, {name: previous?.name ?? ingredient.name, grams: (previous?.grams ?? 0) + ingredient.g});
+ async function sendChat(){if(!message.trim()||busy)return;const input=message.trim();setMessage('');setHistory(h=>[...h,{role:'user',content:input}]);setBusy(true);setError('');try{const context={inventory:items.map(({name,qty,unit,section,date})=>({name,qty,unit,section,date})),savedPlan:plan,savedRecipes:recipes.map(r=>({id:r.id,name:r.name})),proposedPlan:draftPlan,proposedRecipes:draftRecipes,targets,preferences};const res=await fetch('/api/ai',{method:'POST',headers:await aiHeaders(),body:JSON.stringify({mode:'chat',message:input,context,history:history.slice(-12)})});const data=await res.json();if(!res.ok)throw Error(data.error||'Chat failed');setHistory(h=>[...h,{role:'assistant',content:data.reply||'Draft updated.'}]);if(Array.isArray(data.recipes)&&data.recipes.length)setDraftRecipes(old=>{const m=new Map(old.map(r=>[r.id,r]));data.recipes.forEach((r:Recipe)=>{if(r.id&&r.name&&Array.isArray(r.ingredients))m.set(r.id,r)});return [...m.values()]});if(data.plan&&typeof data.plan==='object')setDraftPlan(p=>({...p,...data.plan}));if(Array.isArray(data.shopping))setDraftShopping(data.shopping);}catch(e){setError(e instanceof Error?e.message:'Chat failed');setHistory(h=>[...h,{role:'assistant',content:'I could not connect to AI. Your existing plan is unchanged.'}])}finally{setBusy(false)}}
+ function approvePlan(){if(!Object.keys(draftPlan).length){alert('Ask Kitchen AI to draft a plan first.');return}const all=[...recipes];for(const r of draftRecipes){const index=all.findIndex(x=>x.id===r.id);if(index>=0)all[index]=r;else all.push(r)}const unknown=Object.values(draftPlan).filter(id=>id&&!all.some(r=>r.id===id));if(unknown.length){alert('Some proposed meals do not have complete recipes. Ask AI to regenerate those recipes before approving.');return}setRecipes(all);setPlan(previous=>({...previous,...draftPlan}));setCooked(previous=>Object.fromEntries(Object.entries(previous).filter(([slot])=>!(slot in draftPlan)||draftPlan[slot]===plan[slot])));setShopping(s=>Array.from(new Set([...s,...draftShopping])));setDraftPlan({});setDraftRecipes([]);setDraftShopping([]);setTab('Planner')}
+ function markCooked(slot:string, recipe:Recipe){
+  if(cooked[slot])return;
+  const servings=Number(window.prompt('How many portions did you actually cook?',String(recipe.servings)));
+  if(!Number.isFinite(servings)||servings<=0||recipe.servings<=0)return;
+  const updated=items.map(item=>({...item}));
+  const shortages:string[]=[];
+  for(const ingredient of recipe.ingredients){
+   const amount=canonicalQuantity(recipeQuantity(ingredient));
+   let remaining=amount.qty*servings/recipe.servings;
+   if(!remaining){shortages.push(`${ingredient.name}: amount unspecified`);continue;}
+   const matching=updated.filter(item=>item.qty>0&&ingredientKey(item.name)===ingredientKey(ingredient.name)&&canonicalQuantity(item).unit===amount.unit)
+    .sort((a,b)=>(a.date||'9999').localeCompare(b.date||'9999'));
+   for(const item of matching){
+    const stock=canonicalQuantity(item).qty;
+    const taken=Math.min(stock,remaining);
+    item.qty=stock===taken?0:item.qty*(1-taken/stock);
+    remaining-=taken;
+    if(remaining<=0.000001)break;
+   }
+   if(remaining>0.000001)shortages.push(`${ingredient.name}: ${quantityLabel(remaining,amount.unit)} missing`);
+  }
+  const deductions=items.flatMap((item,index)=>item.qty>updated[index].qty?[`${item.name}: ${quantityLabel(item.qty-updated[index].qty,item.unit)}`]:[]);
+  if(!window.confirm(['Mark cooked and confirm inventory deductions?',...deductions,...shortages].join('\n')))return;
+  setUndo({items,cooked});
+  setItems(updated.filter(item=>item.qty>0));
+  setCooked(previous=>({...previous,[slot]:true}));
+ }
+ function shopMissing(){
+  const needed=new Map<string,{name:string;qty:number;unit:string}>();
+  const available=new Map<string,number>();
+  const unknown=new Set<string>();
+  for(const [slot,id] of Object.entries(plan)){
+   if(cooked[slot])continue;
+   for(const ingredient of recipes.find(recipe=>recipe.id===id)?.ingredients??[]){
+    const {qty,unit}=canonicalQuantity(recipeQuantity(ingredient));
+    if(!qty){unknown.add(`${ingredient.name}: amount unspecified`);continue;}
+    const id=JSON.stringify([ingredientKey(ingredient.name),unit]);
+    const previous=needed.get(id);
+    needed.set(id,{name:previous?.name??ingredient.name,qty:(previous?.qty??0)+qty,unit});
    }
   }
-  const available = new Map<string, number>();
-  for (const item of items) {
-   if (item.unit !== 'g' && item.unit !== 'kg') continue;
-   const key = ingredientKey(item.name);
-   available.set(key, (available.get(key) ?? 0) + item.qty * (item.unit === 'kg' ? 1000 : 1));
+  for(const item of items){
+   const {qty,unit}=canonicalQuantity(item);
+   const id=JSON.stringify([ingredientKey(item.name),unit]);
+   available.set(id,(available.get(id)??0)+qty);
   }
-  setShopping([...needed].flatMap(([key, {name, grams}]) => {
-   const missing = Math.ceil(grams - (available.get(key) ?? 0));
-   return missing > 0 ? [`${name}: ${missing} g`] : [];
-  }));
+  setShopping([...needed].flatMap(([id,{name,qty,unit}])=>{
+   const missing=qty-(available.get(id)??0);
+   return missing>0.000001?[`${name}: ${quantityLabel(missing,unit)}`]:[];
+  }).concat([...unknown]));
   setTab('Shopping');
  }
 
  const tabs:[string,string][]=[['Home','⌂'],['Inventory','▦'],['AI Planner','✦'],['Planner','▤'],['Recipes','♨'],['Shopping','🛒'],['Settings','⚙']];
  return <div className="shell"><header><div className="brand"><div className="mark">✳</div><div><strong>Kitchen</strong><small>Kun & Winnie · Home kitchen</small></div></div><span className="today">{new Date().toLocaleDateString(undefined,{month:'short',day:'numeric'})}</span></header><main>
- {tab==='Home'&&<><div className="hero"><span className="eyebrow">YOUR KITCHEN, SIMPLIFIED</span><h1>What shall we cook this week?</h1><p>Scan groceries, plan with AI, and track what you use.</p><button onClick={()=>setTab('AI Planner')}>Plan with Kitchen AI →</button></div><div className="stats"><div><small>In stock</small><b>{items.length}</b></div><div><small>Use soon</small><b>{expiring.length}</b></div><div><small>Meals planned</small><b>{Object.values(plan).filter(Boolean).length}</b></div></div><section><div className="sectionhead"><h2>Quick actions</h2></div><div className="actions"><button onClick={()=>{setScanKind('groceries');setTab('Inventory')}}>📷 Scan groceries</button><button className="outline" onClick={()=>{setScanKind('receipt');setTab('Inventory')}}>🧾 Import order</button><button className="outline" onClick={()=>setTab('Planner')}>View weekly plan</button></div></section><section><h2>Expiration watch</h2>{expiring.length?expiring.map(i=><div className="line" key={i.id}><div><b>{i.name}</b><small>{i.qty} {i.unit} · {i.date}</small></div><span className="pill warn">{dateDiff(i.date)} days</span></div>):<div className="empty">No dated ingredients expiring within 7 days.</div>}</section><section><h2>Recount reminders</h2>{sections.map((s,index)=>{const elapsed=lastCounts[s]? -(dateDiff(lastCounts[s]) ?? 0) : null;return <div className="line" key={s}><div><b>{s}</b><small>{lastCounts[s]?`Last counted ${lastCounts[s]}`:'Not yet counted'} · suggested every {frequencies[index]} days</small></div><button className="ghost" onClick={()=>{setSection(s);setScanKind('recount');setTab('Inventory')}}>{elapsed===null||elapsed>=frequencies[index]?'Recount →':'Review →'}</button></div>})}</section></>}
- {tab==='Inventory'&&<><h1>Inventory & scans</h1><p className="muted">Photo-first imports. Orders count immediately; no separate delivery confirmation.</p><section><h2>Scan or import</h2><div className="switch">{([['groceries','Groceries'],['receipt','Receipt / order'],['recount','Section recount']] as const).map(([id,label])=><button key={id} className={scanKind===id?'selected':''} disabled={busy} onClick={()=>{setScanKind(id);setScanned([]);setScanPhotos([]);setSummary('')}}>{label}</button>)}</div>{scanKind==='recount'&&<label style={{marginTop:14}}>Choose one section<select value={section} onChange={e=>{setSection(e.target.value as Section);setScanned([])}}>{sections.map(s=><option key={s}>{s}</option>)}</select></label>}<p className="muted">{scanKind==='receipt'?'Upload screenshots or photos of your grocery order/receipt. Variable-weight ranges use their midpoint.':scanKind==='recount'?'Photograph items in this section. Unseen products will not be deleted automatically.':'Photograph food, packaging, nutrition labels and dates. You can select multiple images.'}</p><label className="upload">📷 Choose or take photos<input type="file" accept="image/*" capture={undefined} multiple onChange={e=>{void scan(e.target.files);e.target.value=""}} disabled={busy}/></label>{scanning&&<button className="outline" onClick={()=>{scanAbort.current=true}}>Stop after current photo</button>}
+ {tab==='Home'&&<><div className="hero"><span className="eyebrow">YOUR KITCHEN, SIMPLIFIED</span><h1>What shall we cook this week?</h1><p>Scan groceries, plan with AI, and track what you use.</p><button onClick={()=>setTab('AI Planner')}>Plan with Kitchen AI →</button></div><div className="stats"><div><small>In stock</small><b>{items.length}</b></div><div><small>Use soon</small><b>{expiring.length}</b></div><div><small>Meals planned</small><b>{Object.values(plan).filter(Boolean).length}</b></div></div><section><div className="sectionhead"><h2>Quick actions</h2></div><div className="actions"><button onClick={()=>{setTab('Inventory');if(scanKind==='groceries'||scanPhotos.length||scanned.length)return;setGrouped(false);setScanKind('groceries')}}>📷 Scan groceries</button><button className="outline" onClick={()=>{setTab('Inventory');if(scanKind==='receipt'||scanPhotos.length||scanned.length)return;setGrouped(false);setScanKind('receipt')}}>🧾 Import order</button><button className="outline" onClick={()=>setTab('Planner')}>View weekly plan</button></div></section><section><h2>Expiration watch</h2>{expiring.length?expiring.map(i=><div className="line" key={i.id}><div><b>{i.name}</b><small>{i.qty} {i.unit} · {i.date}</small></div><span className="pill warn">{dateDiff(i.date)} days</span></div>):<div className="empty">No dated ingredients expiring within 7 days.</div>}</section><section><h2>Recount reminders</h2>{sections.map((s,index)=>{const elapsed=lastCounts[s]? -(dateDiff(lastCounts[s]) ?? 0) : null;return <div className="line" key={s}><div><b>{s}</b><small>{lastCounts[s]?`Last counted ${lastCounts[s]}`:'Not yet counted'} · suggested every {frequencies[index]} days</small></div><button className="ghost" onClick={()=>{setTab('Inventory');if(scanPhotos.length||scanned.length)return;setGrouped(false);setSection(s);setScanKind('recount')}}>{elapsed===null||elapsed>=frequencies[index]?'Recount →':'Review →'}</button></div>})}</section></>}
+ {tab==='Inventory'&&<><h1>Inventory & scans</h1><p className="muted">Photo-first imports. Orders count immediately; no separate delivery confirmation.</p><section><h2>Scan or import</h2><div className="switch">{([['groceries','Groceries'],['receipt','Receipt / order'],['recount','Section recount']] as const).map(([id,label])=><button key={id} className={scanKind===id?'selected':''} disabled={busy} onClick={()=>{if(scanKind===id||((scanPhotos.length||scanned.length)&&!window.confirm('Discard this scan draft and switch import mode?')))return;setGrouped(false);setScanKind(id);setScanned([]);setScanPhotos([]);setSummary('')}}>{label}</button>)}</div>{scanKind==='recount'&&<label style={{marginTop:14}}>Choose one section<select value={section} onChange={e=>{if((scanPhotos.length||scanned.length)&&!window.confirm('Discard this scan draft and switch sections?'))return;setSection(e.target.value as Section);setScanned([]);setScanPhotos([])}}>{sections.map(s=><option key={s}>{s}</option>)}</select></label>}<p className="muted">{scanKind==='receipt'?'Upload screenshots or photos of your grocery order/receipt. Variable-weight ranges use their midpoint.':scanKind==='recount'?'Photograph items in this section. Unseen products will not be deleted automatically.':'Photograph food, packaging, nutrition labels and dates. You can select multiple images.'}</p>{scanKind==='groceries'&&<label><span><input type="checkbox" checked={grouped} disabled={busy||scanPhotos.length>0} onChange={e=>setGrouped(e.target.checked)}/> These photos show the same package (2–3)</span></label>}<label className="upload">📷 Choose or take photos<input type="file" accept="image/*" capture={undefined} multiple onChange={e=>{void scan(e.target.files);e.target.value=""}} disabled={busy||!draftLoaded}/></label>{scanning&&<button className="outline" onClick={()=>{scanAbort.current=true}}>Stop after current photo</button>}
 {scanPhotos.length>0&&<details open>
  <summary>{scanPhotos.filter(photo=>photo.status==='done'||photo.status==='review').length} of {scanPhotos.length} photos processed · {scanned.length} draft items · {scanPhotos.filter(photo=>photo.status==='failed').length} failed</summary>
  <ol>{scanPhotos.map((photo,index)=><li key={index}>{photo.file.name} · {photo.status==='review'?'needs review':photo.status}{photo.detail?` · ${photo.detail}`:''}</li>)}</ol>
@@ -167,9 +289,9 @@ export default function Page(){
 </details>}{summary&&<p>{summary}</p>}{scanned.length>0&&<><h3>Review detected items</h3>{scanned.map((i,n)=><div className="scanitem" key={i.id}><div className="sectionhead"><b>{i.originalName||i.name}{i.brand?` · ${i.brand}`:""}</b><button className="ghost" onClick={()=>setScanned(s=>s.filter((_,j)=>j!==n))}>Remove</button></div>{(i.photoIndex ?? 0)>0&&<small>Photo {i.photoIndex} · confidence: {i.confidence||'unknown'} {i.reviewReason?` · ${i.reviewReason}`:''}</small>}<label>Exact product name (keep Chinese/Japanese)<input value={i.name} onChange={e=>setScanned(old=>old.map((x,j)=>j===n?{...x,name:e.target.value}:x))}/></label><label>Brand<input value={i.brand||''} onChange={e=>setScanned(old=>old.map((x,j)=>j===n?{...x,brand:e.target.value}:x))}/></label><div className="two"><label>Quantity<input type="number" min="0" value={i.qty} onChange={e=>setScanned(s=>s.map((x,j)=>j===n?{...x,qty:Number(e.target.value)}:x))}/></label><label>Unit<select value={i.unit} onChange={e=>setScanned(s=>s.map((x,j)=>j===n?{...x,unit:e.target.value}:x))}>{['g','kg','pcs','ml','packs'].map(u=><option key={u}>{u}</option>)}</select></label></div><label>Section<select value={i.section} onChange={e=>setScanned(s=>s.map((x,j)=>j===n?{...x,section:e.target.value as Section}:x))}>{sections.map(s=><option key={s}>{s}</option>)}</select></label><label>Printed date<input type="date" value={i.date||''} onChange={e=>setScanned(s=>s.map((x,j)=>j===n?{...x,date:e.target.value}:x))}/></label>{scanKind==='groceries'&&<label>Package status<select defaultValue="unopened" onChange={e=>{const pct=Number(e.target.value);setScanned(s=>s.map((x,j)=>{if(j!==n)return x;const original=x.packageQty||x.qty;return {...x,qty:Math.round(original*pct)/100,packageQty:original,remainingPct:pct}}))}}><option value="100">Unopened / 100% remaining</option>{[20,40,60,80].map(p=><option value={p} key={p}>{p}% remaining</option>)}</select></label>}{i.rangeMin!=null&&i.rangeMax!=null&&<small>Range: {i.rangeMin}–{i.rangeMax} {i.unit}; midpoint used</small>}{!i.nutritionVerified&&<small>Nutrition not verified from a label</small>}</div>)}<div className="chat"><h3>Review with Kitchen AI</h3><p className="muted">Describe corrections before saving. Example: “Photos 2 and 3 are the same jar; change the brand to 老干妈 and mark it 40% remaining.” AI proposes changes to this draft only.</p>{scanMessages.map((m,n)=><div className={'bubble '+m.role} key={n}>{m.content}</div>)}<textarea rows={2} value={scanChat} onChange={e=>setScanChat(e.target.value)} placeholder="Correct products, brands, quantities, or duplicates…"/><button disabled={busy||!scanChat.trim()} onClick={correctScan}>Review corrections with AI</button></div><div className="actions"><button disabled={busy} onClick={applyImport}>Confirm & update inventory</button><button className="outline" disabled={busy} onClick={()=>{setScanned([]);setScanPhotos([])}}>Discard scan</button></div><p className="muted">Possible duplicates prompt you to replace an existing entry (default), keep it, or add both.</p></>}</section><section><div className="sectionhead"><h2>Current inventory ({items.length})</h2><button className="link" onClick={()=>setShowManual(!showManual)}>{showManual?'Hide':'Manual fallback'}</button></div>{showManual&&<div className="form"><input placeholder="Item name" value={manualName} onChange={e=>setManualName(e.target.value)}/><div className="two"><input type="number" placeholder="Quantity" value={manualQty} onChange={e=>setManualQty(e.target.value)}/><select value={manualUnit} onChange={e=>setManualUnit(e.target.value)}>{['g','kg','pcs','ml','packs'].map(u=><option key={u}>{u}</option>)}</select></div><select value={manualSection} onChange={e=>setManualSection(e.target.value as Section)}>{sections.map(s=><option key={s}>{s}</option>)}</select><input type="date" value={manualDate} onChange={e=>setManualDate(e.target.value)}/><button onClick={saveManual}>Add manually</button></div>}{items.length?items.map(i=><div className="line" key={i.id}><div><b>{i.name}{i.brand?` · ${i.brand}`:""}</b><small>{i.qty} {i.unit} · {i.section}{i.date?` · ${i.date}`:''}</small></div><button className="ghost" onClick={()=>{if(confirm(`Remove ${i.name}?`))setItems(s=>s.filter(x=>x.id!==i.id))}}>×</button></div>):<div className="empty">No groceries yet. Start with a photo or order screenshot.</div>}</section></>}
  {tab==='AI Planner'&&<><h1>Kitchen AI</h1><p className="muted">Ask for a weekly menu, refine it in conversation, then approve. Drafts never change the saved planner until approved.</p><section className="chat"><div className="messages">{history.length?history.map((h,n)=><div className={'bubble '+h.role} key={n}>{h.content}</div>):<div className="empty">Try: “Look at our inventory and plan Monday–Friday Japanese, Thai and Chinese-inspired lunches and dinners. Quick lunches, warm dinners, high protein. Prioritize food expiring soon.”</div>}</div><textarea value={message} onChange={e=>setMessage(e.target.value)} placeholder="Ask Kitchen AI…" rows={3}/><button disabled={busy||!message.trim()} onClick={sendChat}>{busy?'Thinking…':'Send →'}</button></section>{Object.keys(draftPlan).length>0&&<section><h2>Proposed meal plan</h2>{days.map(day=><div className="day" key={day}><b>{day}</b>{['Lunch','Dinner'].map(meal=>{const id=draftPlan[`${day}-${meal}`];const r=[...draftRecipes,...recipes].find(r=>r.id===id);return id?<div className="line" key={meal}><small>{meal}</small><b>{r?.name||'Recipe details missing'}</b></div>:null})}</div>)}<div className="actions"><button onClick={approvePlan}>Approve & save weekly plan</button><button className="outline" onClick={()=>{setDraftPlan({});setDraftRecipes([])}}>Discard draft</button></div></section>}</>}
  {tab==='Planner'&&<><h1>Approved weekly planner</h1><p className="muted">Tap any meal to open its recipe. Mark cooked only after preparing it.</p><section>{days.map(day=><div className="day" key={day}><h3>{day}</h3><div className="two">{['Lunch','Dinner'].map(meal=>{const slot=`${day}-${meal}`;const r=recipes.find(r=>r.id===plan[slot]);return <button className={'mealcard '+(cooked[slot]?'done':'')} key={slot} onClick={()=>{if(r){setRecipeId(r.id);setOpenMeal(slot);setTab('Recipes')}else{setTab('AI Planner')}}}><small>{meal} {cooked[slot]?'✓ Cooked':''}</small><b>{r?.name||'Plan with AI +'}</b></button>})}</div></div>)}</section><div className="actions"><button className="outline" onClick={()=>setTab('AI Planner')}>Adjust plan with AI</button><button className="outline" onClick={shopMissing}>Build shopping list</button>{undo&&<button className="outline" onClick={()=>{setItems(undo.items);setCooked(undo.cooked);setUndo(null)}}>Undo last cooked meal</button>}</div></>}
- {tab==='Recipes'&&<><h1>Recipes</h1><section><h2>Import a recipe</h2><p className="muted">Paste recipe text or ingredients and instructions. AI drafts a structured recipe; nutrition is estimated and must be verified against labels.</p><textarea rows={4} value={recipeImport} onChange={e=>setRecipeImport(e.target.value)} placeholder="Paste a recipe here…"/><button disabled={busy||!recipeImport.trim()} onClick={importRecipe}>Import with AI</button></section><div className="switch">{recipes.map(r=><button key={r.id} className={recipeId===r.id?'selected':''} onClick={()=>{setRecipeId(r.id);setOpenMeal('')}}>{r.name}</button>)}</div>{recipe&&<section><h2>{recipe.name}</h2><p className="muted">{recipe.servings} portions · Nutrition estimates; verify with package labels.</p><div className="stats"><div><small>Per portion kcal</small><b>{Math.round(nutrition(recipe).kcal/recipe.servings)}</b></div><div><small>Protein</small><b>{Math.round(nutrition(recipe).protein/recipe.servings)}g</b></div><div><small>Carbs / fat</small><b>{Math.round(nutrition(recipe).carb/recipe.servings)} / {Math.round(nutrition(recipe).fat/recipe.servings)}g</b></div></div><h3>Ingredients for {recipe.servings} portions</h3>{recipe.ingredients.map((i,n)=><div className="line" key={n}><b>{i.name}</b><span>{i.g} g</span></div>)}<h3>Cooking instructions</h3><ol>{recipe.steps.map((s,n)=><li key={n}>{s}</li>)}</ol>{recipe.notes&&<p className="muted">{recipe.notes}</p>}<div className="actions">{openMeal&&<button disabled={!!cooked[openMeal]} onClick={()=>markCooked(openMeal,recipe)}>{cooked[openMeal]?'✓ Already cooked':'✓ Mark as cooked & deduct stock'}</button>}<button className="outline" onClick={()=>setTab('Planner')}>← Weekly planner</button></div></section>}</>}
+ {tab==='Recipes'&&<><h1>Recipes</h1><section><h2>Import a recipe</h2><p className="muted">Paste recipe text or ingredients and instructions. AI drafts a structured recipe; nutrition is estimated and must be verified against labels.</p><textarea rows={4} value={recipeImport} onChange={e=>setRecipeImport(e.target.value)} placeholder="Paste a recipe here…"/><button disabled={busy||!recipeImport.trim()} onClick={importRecipe}>Import with AI</button></section><div className="switch">{recipes.map(r=><button key={r.id} className={recipeId===r.id?'selected':''} onClick={()=>{setRecipeId(r.id);setOpenMeal('')}}>{r.name}</button>)}</div>{recipe&&<section><h2>{recipe.name}</h2><p className="muted">{recipe.servings} portions · Nutrition estimates may omit ingredients without usable values.</p><div className="stats"><div><small>Per portion kcal</small><b>{nutrition(recipe).kcal?Math.round(nutrition(recipe).kcal/recipe.servings):'—'}</b></div><div><small>Protein</small><b>{nutrition(recipe).kcal?`${Math.round(nutrition(recipe).protein/recipe.servings)} g`:'—'}</b></div><div><small>Carbs / fat</small><b>{nutrition(recipe).kcal?`${Math.round(nutrition(recipe).carb/recipe.servings)} / ${Math.round(nutrition(recipe).fat/recipe.servings)} g`:'—'}</b></div></div><h3>Ingredients for {recipe.servings} portions</h3>{recipe.ingredients.map((i,n)=><div className="line" key={n}><b>{i.name}</b><span>{quantityLabel(recipeQuantity(i).qty,recipeQuantity(i).unit)}</span></div>)}<h3>Cooking instructions</h3><ol>{recipe.steps.map((s,n)=><li key={n}>{s}</li>)}</ol>{recipe.notes&&<p className="muted">{recipe.notes}</p>}<div className="actions">{openMeal&&<button disabled={!!cooked[openMeal]} onClick={()=>markCooked(openMeal,recipe)}>{cooked[openMeal]?'✓ Already cooked':'✓ Mark as cooked & deduct stock'}</button>}<button className="outline" onClick={()=>setTab('Planner')}>← Weekly planner</button></div></section>}</>}
  {tab==='Shopping'&&<><h1>Shopping list</h1><p className="muted">Generate estimated shortages from approved meals or add your own items.</p><section><div className="actions"><button onClick={shopMissing}>Recalculate from approved plan</button><button className="outline" onClick={()=>navigator.clipboard?.writeText(shopping.join('\n'))}>Copy list</button></div>{shopping.length?shopping.map((s,n)=><div className="line" key={n}><b>{s}</b><button className="ghost" onClick={()=>setShopping(x=>x.filter((_,j)=>j!==n))}>Remove</button></div>):<div className="empty">No shopping requirements yet.</div>}<p className="muted">Live retailer availability and prices are not connected in this release. Shopping estimates exclude meals already marked cooked, but ingredient matching is exact-name only and may need review.</p></section></>}
- {tab==='Settings'&&<><h1>Settings & data</h1><section><h2>Shared Kitchen (Supabase)</h2><p className="muted">{cloudStatus}</p>{!cloud?<p>Supabase environment variables are missing from this deployment.</p>:authUser?<><p>Signed in as {authUser}</p><div className="actions"><button className="outline" onClick={signOut}>Sign out</button>{householdId&&!cloudReady&&<button onClick={migrateBrowser}>Back up & migrate browser data</button>}</div>{cloudReady&&<p>Shared sync is active. Always verify inventory on both devices before relying on it.</p>}</>:<><input type="email" placeholder="Email" value={authEmail} onChange={e=>setAuthEmail(e.target.value)}/><input type="password" placeholder="Password" value={authPassword} onChange={e=>setAuthPassword(e.target.value)}/><button disabled={authBusy||!authEmail||!authPassword} onClick={signIn}>Sign in to Kitchen</button></>}<p className="muted">Keep a JSON backup. Cloud changes use conflict detection; if sync pauses, reload rather than overwriting another person's changes.</p></section><section><h2>AI configuration</h2><p>The server-side OpenAI API key is configured in Vercel as <code>OPENAI_API_KEY</code>. Never enter an API key in the browser. If it is missing, AI features show a setup error; manual inventory and saved recipes still work.</p><p className="muted">When Shared Kitchen sync is active, household data is saved to Supabase. Keep a JSON backup before major updates; cloud sync is not a substitute for a separate backup.</p><div className="switch">{['Kun','Winnie'].map(p=><button className={person===p?'selected':''} key={p} onClick={()=>setPerson(p)}>{p}</button>)}</div><p>Reference target: {person==='Kun'?'2,100 kcal / 180g protein':'1,350 kcal / 100g protein'} daily. These are planning defaults, not medical recommendations.</p><button onClick={exportBackup}>Export backup</button></section></>}
+ {tab==='Settings'&&<><h1>Settings & data</h1><section><h2>Shared Kitchen (Supabase)</h2><p className="muted">{cloudStatus}</p>{!cloud?<p>Supabase environment variables are missing from this deployment.</p>:authUser?<><p>Signed in as {authUser}</p><div className="actions"><button className="outline" onClick={signOut}>Sign out</button>{householdId&&!cloudReady&&<button onClick={migrateBrowser}>Back up & migrate browser data</button>}</div>{cloudReady&&<p>Shared sync is active. Always verify inventory on both devices before relying on it.</p>}</>:<><input type="email" placeholder="Email" value={authEmail} onChange={e=>setAuthEmail(e.target.value)}/><input type="password" placeholder="Password" value={authPassword} onChange={e=>setAuthPassword(e.target.value)}/><button disabled={authBusy||!authEmail||!authPassword} onClick={signIn}>Sign in to Kitchen</button></>}<p className="muted">Keep a JSON backup. Cloud changes use conflict detection; if sync pauses, reload rather than overwriting another person's changes.</p></section><section><h2>AI configuration</h2><p>The server-side OpenAI API key is configured in Vercel as <code>OPENAI_API_KEY</code>. Never enter an API key in the browser. If it is missing, AI features show a setup error; manual inventory and saved recipes still work.</p><p className="muted">When Shared Kitchen sync is active, household data is saved to Supabase. Keep a JSON backup before major updates; cloud sync is not a substitute for a separate backup.</p><div className="switch">{(['Kun','Winnie'] as const).map(p=><button className={person===p?'selected':''} key={p} onClick={()=>setPerson(p)}>{p}</button>)}</div><div className="two">{(['calories','protein'] as const).map(metric=><label key={metric}>{metric==='calories'?'Daily calories (kcal)':'Daily protein (g)'}<input type="number" min="1" value={targets[person][metric]||''} onChange={e=>{const value=Math.max(0,Number(e.target.value));setTargets(old=>({...old,[person]:{...old[person],[metric]:value}}))}}/></label>)}</div><label>Meal planning preferences<textarea value={preferences} onChange={e=>setPreferences(e.target.value)} rows={3} maxLength={1500}/></label><button onClick={exportBackup}>Export backup</button></section></>}
  {error&&<div className="error" role="alert">{error}<button className="ghost" onClick={()=>setError('')}>Dismiss</button></div>}
  </main><nav>{tabs.map(([t,icon])=><button key={t} className={tab===t?'active':''} onClick={()=>{setTab(t);setError('')}}><span>{icon}</span><small>{t}</small></button>)}</nav></div>
 }
